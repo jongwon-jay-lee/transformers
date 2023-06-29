@@ -40,7 +40,7 @@ from ...utils import (
 )
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_gptj import GPTJConfig
-
+from .parallel_layers import TensorParallelColumnLinear, TensorParallelRowLinear, TensorParallelEmbedding
 
 logger = logging.get_logger(__name__)
 
@@ -80,7 +80,7 @@ def apply_rotary_pos_emb(tensor: torch.Tensor, sin: torch.Tensor, cos: torch.Ten
 
 
 class GPTJAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, process_group: Optional[torch.distributed.ProcessGroup] = None):
         super().__init__()
 
         max_positions = config.max_position_embeddings
@@ -99,17 +99,26 @@ class GPTJAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_attention_heads
-        if self.head_dim * self.num_attention_heads != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_attention_heads (got `embed_dim`: {self.embed_dim} and"
-                f" `num_attention_heads`: {self.num_attention_heads})."
-            )
-        self.scale_attn = torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32)).to(torch.get_default_dtype())
 
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        if process_group is None:
+            if self.head_dim * self.num_attention_heads != self.embed_dim:
+                raise ValueError(
+                    f"embed_dim must be divisible by num_attention_heads (got `embed_dim`: {self.embed_dim} and"
+                    f" `num_attention_heads`: {self.num_attention_heads})."
+                )
+            self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+            self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+            self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+            self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        else:
+            assert self.num_attention_heads % process_group.size() == 0
+            self.num_attention_heads = self.num_attention_heads // process_group.size()
+            self.k_proj = TensorParallelColumnLinear(self.embed_dim, self.embed_dim, bias=False, process_group=process_group)
+            self.v_proj = TensorParallelColumnLinear(self.embed_dim, self.embed_dim, bias=False, process_group=process_group)
+            self.q_proj = TensorParallelColumnLinear(self.embed_dim, self.embed_dim, bias=False, process_group=process_group)
+            self.out_proj = TensorParallelRowLinear(self.embed_dim, self.embed_dim, bias=False, process_group=process_group)
+
+        self.scale_attn = torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32)).to(torch.get_default_dtype())
         self.rotary_dim = config.rotary_dim
         pos_embd_dim = self.rotary_dim or self.embed_dim
         self.embed_positions = create_sinusoidal_positions(max_positions, pos_embd_dim)
@@ -268,12 +277,16 @@ class GPTJAttention(nn.Module):
 
 
 class GPTJMLP(nn.Module):
-    def __init__(self, intermediate_size, config):  # in MLP: intermediate_size= 4 * embed_dim
+    def __init__(self, intermediate_size, config, process_group: Optional[torch.distributed.ProcessGroup] = None):  # in MLP: intermediate_size= 4 * embed_dim
         super().__init__()
         embed_dim = config.n_embd
 
-        self.fc_in = nn.Linear(embed_dim, intermediate_size)
-        self.fc_out = nn.Linear(intermediate_size, embed_dim)
+        if process_group is None:
+            self.fc_in = nn.Linear(embed_dim, intermediate_size)
+            self.fc_out = nn.Linear(intermediate_size, embed_dim)
+        else:
+            self.fc_in = TensorParallelColumnLinear(embed_dim, intermediate_size, process_group=process_group)
+            self.fc_out = TensorParallelRowLinear(intermediate_size, embed_dim, process_group=process_group)
 
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
@@ -287,12 +300,12 @@ class GPTJMLP(nn.Module):
 
 
 class GPTJBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, process_group: Optional[torch.distributed.ProcessGroup] = None):
         super().__init__()
         inner_dim = config.n_inner if config.n_inner is not None else 4 * config.n_embd
         self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        self.attn = GPTJAttention(config)
-        self.mlp = GPTJMLP(inner_dim, config)
+        self.attn = GPTJAttention(config, process_group=process_group)
+        self.mlp = GPTJMLP(inner_dim, config, process_group=process_group)
 
     def forward(
         self,
@@ -370,7 +383,6 @@ GPTJ_START_DOCSTRING = r"""
     This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) sub-class. Use
     it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage and
     behavior.
-
     Parameters:
         config ([`GPTJConfig`]): Model configuration class with all the parameters of the model.
             Initializing with a config file does not load the weights associated with the model, only the
@@ -381,37 +393,28 @@ GPTJ_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
-
             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
-
             [What are input IDs?](../glossary#input-ids)
         attention_mask (`torch.FloatTensor` of shape `({0})`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
-
             [What are attention masks?](../glossary#attention-mask)
         token_type_ids (`torch.LongTensor` of shape `({0})`, *optional*):
             Segment token indices to indicate first and second portions of the inputs. Indices are selected in `[0,
             1]`:
-
             - 0 corresponds to a *sentence A* token,
             - 1 corresponds to a *sentence B* token.
-
             [What are token type IDs?](../glossary#token-type-ids)
         position_ids (`torch.LongTensor` of shape `({0})`, *optional*):
             Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
             config.n_positions - 1]`.
-
             [What are position IDs?](../glossary#position-ids)
         head_mask (`torch.FloatTensor` of shape `(num_attention_heads,)` or `(n_layer, num_attention_heads)`, *optional*):
             Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
-
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
-
         inputs_embeds (`torch.FloatTensor` of shape `({0}, hidden_dim)`, *optional*):
             Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
             is useful if you want more control over how to convert *input_ids* indices into associated vectors than the
@@ -430,18 +433,14 @@ PARALLELIZE_DOCSTRING = r"""
     This is an experimental feature and is a subject to change at a moment's notice. Uses a device map to distribute
     attention modules of the model across several devices. If no device map is given, it will evenly distribute blocks
     across all devices.
-
     Args:
         device_map (`Dict[int, list]`, optional, defaults to None):
             A dictionary that maps attention modules to devices. Note that the embedding module and LMHead are always
             automatically mapped to the first device (for esoteric reasons). That means that the first device should
             have fewer attention modules mapped to it than other devices. For reference, the GPT-J models have the
             following number of attention modules:
-
                 - gpt-j-6B: 28
-
     Example:
-
     ```python
     # Here is an example of a device map on a machine with 4 GPUs using gpt-j-6B, which has a total of 28 attention modules:
     model = GPTJForCausalLM.from_pretrained("EleutherAI/gpt-j-6B")
@@ -457,9 +456,7 @@ PARALLELIZE_DOCSTRING = r"""
 
 DEPARALLELIZE_DOCSTRING = r"""
     Moves the model to CPU from a model parallel state.
-
     Example:
-
     ```python
     # On a 4 GPU machine with gpt-j-6B:
     model = GPTJForCausalLM.from_pretrained("EleutherAI/gpt-j-6B")
@@ -480,14 +477,19 @@ DEPARALLELIZE_DOCSTRING = r"""
     GPTJ_START_DOCSTRING,
 )
 class GPTJModel(GPTJPreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config, process_group: Optional[torch.distributed.ProcessGroup] = None):
         super().__init__(config)
 
         self.embed_dim = config.n_embd
         self.vocab_size = config.vocab_size
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        if process_group is None:
+            self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        else:
+            self.wte = TensorParallelEmbedding(config.vocab_size, self.embed_dim, process_group=process_group)
+            self.tp_rank = process_group.rank()
+            self.tp_world_size = process_group.size()
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPTJBlock(config) for _ in range(config.n_layer)])
+        self.h = nn.ModuleList([GPTJBlock(config, process_group=process_group) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
@@ -734,12 +736,21 @@ class GPTJModel(GPTJPreTrainedModel):
     GPTJ_START_DOCSTRING,
 )
 class GPTJForCausalLM(GPTJPreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    _keys_to_ignore_on_load_unexpected = [r"h\.\d+\.attn\.masked_bias", r"h\.\d+\.attn\.bias"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.transformer = GPTJModel(config)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        if config.tp_parallel:
+            self.process_group = torch.distributed.distributed_c10d._get_default_group()
+        else:
+            self.process_group = None
+
+        self.transformer = GPTJModel(config, process_group=self.process_group)
+
+        if self.process_group is None:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size // self.process_group.size())
 
         # Model parallel
         self.model_parallel = False
@@ -919,10 +930,8 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
 @add_start_docstrings(
     """
     The GPT-J Model transformer with a sequence classification head on top (linear layer).
-
     [`GPTJForSequenceClassification`] uses the last token in order to do the classification, as other causal models
     (e.g. GPT, GPT-2, GPT-Neo) do.
-
     Since it does classification on the last token, it requires to know the position of the last token. If a
     `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
     no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
@@ -932,6 +941,8 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
     GPTJ_START_DOCSTRING,
 )
 class GPTJForSequenceClassification(GPTJPreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.masked_bias", r"h\.\d+\.attn\.bias", r"lm_head.weight"]
+
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1056,6 +1067,8 @@ class GPTJForSequenceClassification(GPTJPreTrainedModel):
     GPTJ_START_DOCSTRING,
 )
 class GPTJForQuestionAnswering(GPTJPreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.masked_bias", r"h\.\d+\.attn\.bias", r"lm_head.weight"]
+
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels

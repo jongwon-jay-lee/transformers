@@ -38,7 +38,6 @@ class GPTJConfig(PretrainedConfig):
     [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B) architecture. Configuration objects inherit from
     [`PretrainedConfig`] and can be used to control the model outputs. Read the documentation from [`PretrainedConfig`]
     for more information.
-
     Args:
         vocab_size (`int`, *optional*, defaults to 50400):
             Vocabulary size of the GPT-J model. Defines the number of different tokens that can be represented by the
@@ -70,18 +69,13 @@ class GPTJConfig(PretrainedConfig):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models).
-
     Example:
-
     ```python
     >>> from transformers import GPTJModel, GPTJConfig
-
     >>> # Initializing a GPT-J 6B configuration
     >>> configuration = GPTJConfig()
-
     >>> # Initializing a model from the configuration
     >>> model = GPTJModel(configuration)
-
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
@@ -112,6 +106,7 @@ class GPTJConfig(PretrainedConfig):
         bos_token_id=50256,
         eos_token_id=50256,
         tie_word_embeddings=False,
+        tp_parallel=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -131,6 +126,8 @@ class GPTJConfig(PretrainedConfig):
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+
+        self.tp_parallel = tp_parallel
 
         super().__init__(
             bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
